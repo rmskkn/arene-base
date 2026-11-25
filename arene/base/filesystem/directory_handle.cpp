@@ -103,6 +103,54 @@ auto is_valid_relative_path(null_terminated_string_view path) noexcept -> bool {
   }
   return true;
 }
+
+/// @brief Flags passed to @c openat2 to require that path resolution not follow any symlink, and not escape the
+/// directory resolution started from, anywhere in the path (not just the final component). @c is_valid_relative_path
+/// only rejects ".." lexically; a symlink partway through the path can still point outside the directory tree, which
+/// these flags close off at the kernel level.
+constexpr std::uint64_t no_symlink_traversal_resolve_flags{RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH};
+
+/// @brief The result of splitting a relative path into its final path component and the path to its parent
+/// directory.
+struct split_path {
+  /// @brief The path to the parent directory of @c leaf, relative to the directory_handle. Empty if @c leaf is the
+  /// whole of the original path, i.e. it contains no '/'.
+  string_view directory;
+  /// @brief The final path component.
+  null_terminated_string_view leaf;
+};
+
+/// @brief Split @c relative_name into its final path component and the directory path leading to it.
+auto split_last_component(null_terminated_string_view const relative_name) noexcept -> split_path {
+  string_view const view{relative_name};
+  auto const slash_pos = view.rfind('/');
+  if (slash_pos == string_view::npos) {
+    return {string_view{}, relative_name};
+  }
+  return {view.substr(0, slash_pos), relative_name.substr(slash_pos + 1U)};
+}
+
+/// @brief Resolve @c directory_path (which must not include the final path component of the original relative
+/// path) relative to @c parent_handle, rejecting any symlink encountered while resolving it. Used by syscalls that,
+/// unlike @c openat, have no symlink-aware "2" variant of their own (@c mkdirat, @c unlinkat, @c fstatat, @c
+/// renameat): they are given the fd this returns together with the final path component, instead of @c
+/// parent_handle together with the whole original path.
+auto resolve_parent_directory(int const parent_handle, string_view const directory_path) noexcept
+    -> result<file_handle, error_code> {
+  path_string const null_terminated_directory_path{directory_path};
+  // parasoft-begin-suppress AUTOSAR-A8_5_2-a-2 "open_how is a C API struct; zero-initialization is required"
+  struct open_how how {};
+  // parasoft-end-suppress AUTOSAR-A8_5_2-a-2
+  // NOLINTNEXTLINE(hicpp-signed-bitwise)
+  how.flags = static_cast<std::uint64_t>(O_DIRECTORY | O_CLOEXEC);
+  how.resolve = no_symlink_traversal_resolve_flags;
+  // NOLINTNEXTLINE(hicpp-vararg)
+  file_handle resolved{openat2(parent_handle, null_terminated_directory_path.c_str(), &how, sizeof(how))};
+  if (!resolved.valid()) {
+    return {in_place_error, error_code::from_errno()};
+  }
+  return {in_place_value, std::move(resolved)};
+}
 }  // namespace
 
 directory_handle::directory_handle(file_handle source_handle)
@@ -192,7 +240,18 @@ auto directory_handle::create_subdirectory(null_terminated_string_view const dir
   constexpr mode_t directory_permissions{S_IRWXU};
   // parasoft-end-suppress AUTOSAR-M5_0_4-a-2
   // parasoft-end-suppress AUTOSAR-M5_0_21-a-2
-  if (mkdirat(raw_handle_, dir_name.c_str(), directory_permissions) != 0) {
+  auto const split = split_last_component(dir_name);
+  if (split.directory.empty()) {
+    if (mkdirat(raw_handle_, dir_name.c_str(), directory_permissions) != 0) {
+      return {in_place_error, error_code::from_errno()};
+    }
+    return {};
+  }
+  auto parent = resolve_parent_directory(raw_handle_, split.directory);
+  if (!parent) {
+    return {in_place_error, parent.error()};
+  }
+  if (mkdirat(parent.value().get_fd(), split.leaf.c_str(), directory_permissions) != 0) {
     return {in_place_error, error_code::from_errno()};
   }
   return {};
@@ -217,12 +276,15 @@ auto directory_handle::open_subdirectory(null_terminated_string_view const relat
   if (!is_valid_relative_path(relative_name)) {
     return {in_place_error, EINVAL};
   }
+  // parasoft-begin-suppress AUTOSAR-A8_5_2-a-2 "open_how is a C API struct; zero-initialization is required"
+  struct open_how how {};
+  // parasoft-end-suppress AUTOSAR-A8_5_2-a-2
+  // NOLINTNEXTLINE(hicpp-signed-bitwise)
+  how.flags = static_cast<std::uint64_t>(O_DIRECTORY | O_CLOEXEC);
+  how.resolve = no_symlink_traversal_resolve_flags;
   file_handle entry_handle{
-      // parasoft-begin-suppress AUTOSAR-M5_0_21-a-2 "This is how the POSIX documentation intends these flags to be
-      // used"
-      // NOLINTNEXTLINE(hicpp-vararg,hicpp-signed-bitwise)
-      openat(raw_handle_, relative_name.c_str(), O_DIRECTORY | O_CLOEXEC)
-      // parasoft-end-suppress AUTOSAR-M5_0_21-a-2
+      // NOLINTNEXTLINE(hicpp-vararg)
+      openat2(raw_handle_, relative_name.c_str(), &how, sizeof(how))
   };
   if (!entry_handle.valid()) {
     return {in_place_error, error_code::from_errno()};
@@ -236,7 +298,18 @@ auto directory_handle::get_file_stats(null_terminated_string_view const relative
     return {in_place_error, EINVAL};
   }
   struct stat file_info {};
-  if (fstatat(raw_handle_, relative_name.c_str(), &file_info, AT_SYMLINK_NOFOLLOW) != 0) {
+  auto const split = split_last_component(relative_name);
+  if (split.directory.empty()) {
+    if (fstatat(raw_handle_, relative_name.c_str(), &file_info, AT_SYMLINK_NOFOLLOW) != 0) {
+      return {in_place_error, error_code::from_errno()};
+    }
+    return {in_place_value, file_info};
+  }
+  auto parent = resolve_parent_directory(raw_handle_, split.directory);
+  if (!parent) {
+    return {in_place_error, parent.error()};
+  }
+  if (fstatat(parent.value().get_fd(), split.leaf.c_str(), &file_info, AT_SYMLINK_NOFOLLOW) != 0) {
     return {in_place_error, error_code::from_errno()};
   }
   return {in_place_value, file_info};
@@ -249,7 +322,19 @@ auto directory_handle::unlink_entry(null_terminated_string_view const relative_n
   if (!is_valid_relative_path(relative_name)) {
     return {in_place_error, EINVAL};
   }
-  if (unlinkat(raw_handle_, relative_name.c_str(), (type == unlink_type::directory) ? AT_REMOVEDIR : 0) != 0) {
+  auto const remove_dir_flag = (type == unlink_type::directory) ? AT_REMOVEDIR : 0;
+  auto const split = split_last_component(relative_name);
+  if (split.directory.empty()) {
+    if (unlinkat(raw_handle_, relative_name.c_str(), remove_dir_flag) != 0) {
+      return {in_place_error, error_code::from_errno()};
+    }
+    return {};
+  }
+  auto parent = resolve_parent_directory(raw_handle_, split.directory);
+  if (!parent) {
+    return {in_place_error, parent.error()};
+  }
+  if (unlinkat(parent.value().get_fd(), split.leaf.c_str(), remove_dir_flag) != 0) {
     return {in_place_error, error_code::from_errno()};
   }
   return {};
@@ -309,8 +394,13 @@ auto directory_handle::open_file(null_terminated_string_view const relative_name
   errno = 0;
   // parasoft-end-suppress AUTOSAR-M19_3_1-a
   // parasoft-end-suppress AUTOSAR-A17_1_1-a
+  // parasoft-begin-suppress AUTOSAR-A8_5_2-a-2 "open_how is a C API struct; zero-initialization is required"
+  struct open_how how {};
+  // parasoft-end-suppress AUTOSAR-A8_5_2-a-2
+  how.flags = static_cast<std::uint64_t>(get_open_flags(flags));
+  how.resolve = no_symlink_traversal_resolve_flags;
   // NOLINTNEXTLINE(hicpp-vararg)
-  file_handle entry_handle{openat(raw_handle_, relative_name.c_str(), get_open_flags(flags))};
+  file_handle entry_handle{openat2(raw_handle_, relative_name.c_str(), &how, sizeof(how))};
   if (!entry_handle.valid()) {
     return {in_place_error, error_code::from_errno()};
   }
@@ -375,8 +465,14 @@ auto directory_handle::create_file(null_terminated_string_view relative_name, cr
   constexpr mode_t file_permissions{S_IRUSR | S_IWUSR};
   // parasoft-end-suppress AUTOSAR-M5_0_4-a-2
   // parasoft-end-suppress AUTOSAR-M5_0_21-a-2
+  // parasoft-begin-suppress AUTOSAR-A8_5_2-a-2 "open_how is a C API struct; zero-initialization is required"
+  struct open_how how {};
+  // parasoft-end-suppress AUTOSAR-A8_5_2-a-2
+  how.flags = static_cast<std::uint64_t>(get_creation_flags(flags));
+  how.mode = file_permissions;
+  how.resolve = no_symlink_traversal_resolve_flags;
   // NOLINTNEXTLINE(hicpp-vararg)
-  file_handle entry_handle{openat(raw_handle_, relative_name.c_str(), get_creation_flags(flags), file_permissions)};
+  file_handle entry_handle{openat2(raw_handle_, relative_name.c_str(), &how, sizeof(how))};
   if (!entry_handle.valid()) {
     return {in_place_error, error_code::from_errno()};
   }
@@ -388,7 +484,32 @@ auto directory_handle::rename(null_terminated_string_view const old_name, null_t
   if ((!is_valid_relative_path(old_name)) || (!is_valid_relative_path(new_name))) {
     return {in_place_error, EINVAL};
   }
-  if (renameat(raw_handle_, old_name.c_str(), raw_handle_, new_name.c_str()) != 0) {
+  auto const old_split = split_last_component(old_name);
+  auto const new_split = split_last_component(new_name);
+
+  file_handle old_parent_handle;
+  int old_fd{raw_handle_};
+  if (!old_split.directory.empty()) {
+    auto resolved_old_parent = resolve_parent_directory(raw_handle_, old_split.directory);
+    if (!resolved_old_parent) {
+      return {in_place_error, resolved_old_parent.error()};
+    }
+    old_parent_handle = std::move(resolved_old_parent.value());
+    old_fd = old_parent_handle.get_fd();
+  }
+
+  file_handle new_parent_handle;
+  int new_fd{raw_handle_};
+  if (!new_split.directory.empty()) {
+    auto resolved_new_parent = resolve_parent_directory(raw_handle_, new_split.directory);
+    if (!resolved_new_parent) {
+      return {in_place_error, resolved_new_parent.error()};
+    }
+    new_parent_handle = std::move(resolved_new_parent.value());
+    new_fd = new_parent_handle.get_fd();
+  }
+
+  if (renameat(old_fd, old_split.leaf.c_str(), new_fd, new_split.leaf.c_str()) != 0) {
     return {in_place_error, error_code::from_errno()};
   }
   return {};

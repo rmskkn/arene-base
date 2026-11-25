@@ -10,6 +10,7 @@
 #include <set>
 #include <string>
 #include <system_error>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
@@ -1090,6 +1091,171 @@ TEST(DirectoryHandle, CannotCreateTemporaryFileInUnwritableDirectory) {
   ASSERT_FALSE(create_file_result);
   ASSERT_STRNE(create_file_result.error().message().c_str(), "");
   ASSERT_NE(create_file_result.error().value(), 0);
+}
+
+/// @brief Create a symlink at `link_path` pointing to `target_path`.
+void create_symlink(
+    arene::base::null_terminated_string_view const link_path, arene::base::null_terminated_string_view const target_path
+) {
+  ASSERT_EQ(symlink(target_path.c_str(), link_path.c_str()), 0);
+}
+
+/// @test `open_file` does not follow a symlink used as an intermediate path component to escape the directory tree
+/// referred to by the `directory_handle`
+TEST(DirectoryHandle, OpenFileThroughSymlinkedIntermediateDirectoryIsRejected) {
+  arene::base::filesystem::temporary_directory const sandbox;
+  arene::base::filesystem::temporary_directory const outside;
+
+  arene::base::filesystem::path_string const secret_path{outside.path() + "/secret.dat"};
+  write_test_data(secret_path, "outside secret");
+  arene::base::filesystem::path_string const link_path{sandbox.path() + "/escape_link"};
+  create_symlink(link_path, outside.path());
+
+  auto open_result = arene::base::filesystem::directory_handle::open(sandbox.path());
+  ASSERT_TRUE(open_result);
+  auto dir_handle = std::move(open_result.value());
+
+  arene::base::filesystem::path_string const escape_path{"escape_link/secret.dat"};
+  auto file_result = dir_handle.open_file(escape_path);
+  ASSERT_FALSE(file_result);
+}
+
+/// @test `create_file` does not follow a symlink used as an intermediate path component to escape the directory tree
+/// referred to by the `directory_handle`
+TEST(DirectoryHandle, CreateFileThroughSymlinkedIntermediateDirectoryIsRejected) {
+  arene::base::filesystem::temporary_directory const sandbox;
+  arene::base::filesystem::temporary_directory const outside;
+
+  arene::base::filesystem::path_string const link_path{sandbox.path() + "/escape_link"};
+  create_symlink(link_path, outside.path());
+
+  auto open_result = arene::base::filesystem::directory_handle::open(sandbox.path());
+  ASSERT_TRUE(open_result);
+  auto dir_handle = std::move(open_result.value());
+
+  arene::base::filesystem::path_string const escape_path{"escape_link/new_file.dat"};
+  auto create_result = dir_handle.create_file(escape_path);
+  ASSERT_FALSE(create_result);
+
+  arene::base::filesystem::path_string const escaped_path{outside.path() + "/new_file.dat"};
+  ASSERT_NE(access(escaped_path.c_str(), F_OK), 0);
+}
+
+/// @test `open_subdirectory` does not follow a symlink used as an intermediate path component to escape the
+/// directory tree referred to by the `directory_handle`
+TEST(DirectoryHandle, OpenSubdirectoryThroughSymlinkedIntermediateDirectoryIsRejected) {
+  arene::base::filesystem::temporary_directory const sandbox;
+  arene::base::filesystem::temporary_directory const outside;
+
+  arene::base::filesystem::path_string const outside_subdir_path{outside.path() + "/real_subdir"};
+  ASSERT_EQ(mkdir(outside_subdir_path.c_str(), S_IRWXU), 0);
+  arene::base::filesystem::path_string const link_path{sandbox.path() + "/escape_link"};
+  create_symlink(link_path, outside.path());
+
+  auto open_result = arene::base::filesystem::directory_handle::open(sandbox.path());
+  ASSERT_TRUE(open_result);
+  auto dir_handle = std::move(open_result.value());
+
+  arene::base::filesystem::path_string const escape_path{"escape_link/real_subdir"};
+  auto subdir_result = dir_handle.open_subdirectory(escape_path);
+  ASSERT_FALSE(subdir_result);
+}
+
+/// @test `create_subdirectory` does not follow a symlink used as an intermediate path component to escape the
+/// directory tree referred to by the `directory_handle`
+TEST(DirectoryHandle, CreateSubdirectoryThroughSymlinkedIntermediateDirectoryIsRejected) {
+  arene::base::filesystem::temporary_directory const sandbox;
+  arene::base::filesystem::temporary_directory const outside;
+
+  arene::base::filesystem::path_string const link_path{sandbox.path() + "/escape_link"};
+  create_symlink(link_path, outside.path());
+
+  auto open_result = arene::base::filesystem::directory_handle::open(sandbox.path());
+  ASSERT_TRUE(open_result);
+  auto dir_handle = std::move(open_result.value());
+
+  arene::base::filesystem::path_string const escape_path{"escape_link/new_subdir"};
+  auto create_result = dir_handle.create_subdirectory(escape_path);
+  ASSERT_FALSE(create_result);
+
+  arene::base::filesystem::path_string const escaped_path{outside.path() + "/new_subdir"};
+  ASSERT_NE(access(escaped_path.c_str(), F_OK), 0);
+}
+
+/// @test `get_file_stats` does not follow a symlink used as an intermediate path component to escape the directory
+/// tree referred to by the `directory_handle`
+TEST(DirectoryHandle, GetFileStatsThroughSymlinkedIntermediateDirectoryIsRejected) {
+  arene::base::filesystem::temporary_directory const sandbox;
+  arene::base::filesystem::temporary_directory const outside;
+
+  arene::base::filesystem::path_string const secret_path{outside.path() + "/secret.dat"};
+  write_test_data(secret_path, "outside secret");
+  arene::base::filesystem::path_string const link_path{sandbox.path() + "/escape_link"};
+  create_symlink(link_path, outside.path());
+
+  auto open_result = arene::base::filesystem::directory_handle::open(sandbox.path());
+  ASSERT_TRUE(open_result);
+  auto dir_handle = std::move(open_result.value());
+
+  arene::base::filesystem::path_string const escape_path{"escape_link/secret.dat"};
+  auto stats_result = dir_handle.get_file_stats(escape_path);
+  ASSERT_FALSE(stats_result);
+}
+
+/// @test `unlink_entry` does not follow a symlink used as an intermediate path component to escape the directory
+/// tree referred to by the `directory_handle`
+TEST(DirectoryHandle, UnlinkEntryThroughSymlinkedIntermediateDirectoryIsRejected) {
+  arene::base::filesystem::temporary_directory const sandbox;
+  arene::base::filesystem::temporary_directory const outside;
+
+  arene::base::filesystem::path_string const secret_path{outside.path() + "/secret.dat"};
+  write_test_data(secret_path, "outside secret");
+  arene::base::filesystem::path_string const link_path{sandbox.path() + "/escape_link"};
+  create_symlink(link_path, outside.path());
+
+  auto open_result = arene::base::filesystem::directory_handle::open(sandbox.path());
+  ASSERT_TRUE(open_result);
+  auto dir_handle = std::move(open_result.value());
+
+  arene::base::filesystem::path_string const escape_path{"escape_link/secret.dat"};
+  auto unlink_result =
+      dir_handle.unlink_entry(escape_path, arene::base::filesystem::directory_handle::unlink_type::other);
+  ASSERT_FALSE(unlink_result);
+
+  ASSERT_EQ(access(secret_path.c_str(), F_OK), 0);
+}
+
+/// @test `rename` does not follow a symlink used as an intermediate path component of either the source or
+/// destination path, to escape the directory tree referred to by the `directory_handle`
+TEST(DirectoryHandle, RenameThroughSymlinkedIntermediateDirectoryIsRejected) {
+  arene::base::filesystem::temporary_directory const sandbox;
+  arene::base::filesystem::temporary_directory const outside;
+
+  arene::base::filesystem::path_string const secret_path{outside.path() + "/secret.dat"};
+  write_test_data(secret_path, "outside secret");
+  arene::base::filesystem::path_string const link_path{sandbox.path() + "/escape_link"};
+  create_symlink(link_path, outside.path());
+
+  auto open_result = arene::base::filesystem::directory_handle::open(sandbox.path());
+  ASSERT_TRUE(open_result);
+  auto dir_handle = std::move(open_result.value());
+
+  // Source path escapes through the symlink.
+  arene::base::filesystem::path_string const escape_source{"escape_link/secret.dat"};
+  arene::base::filesystem::path_string const renamed_name{"renamed.dat"};
+  auto rename_source_result = dir_handle.rename(escape_source, renamed_name);
+  ASSERT_FALSE(rename_source_result);
+
+  // Create a file inside the sandbox and try to rename it to a destination that escapes through the symlink.
+  arene::base::filesystem::path_string const inside_path{sandbox.path() + "/inside.dat"};
+  write_test_data(inside_path, "inside data");
+  arene::base::filesystem::path_string const inside_name{"inside.dat"};
+  arene::base::filesystem::path_string const escape_dest{"escape_link/renamed.dat"};
+  auto rename_dest_result = dir_handle.rename(inside_name, escape_dest);
+  ASSERT_FALSE(rename_dest_result);
+
+  arene::base::filesystem::path_string const escaped_path{outside.path() + "/renamed.dat"};
+  ASSERT_NE(access(escaped_path.c_str(), F_OK), 0);
 }
 
 }  // namespace
